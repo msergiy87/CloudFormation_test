@@ -1,0 +1,214 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "AWS CloudFormation sample template",
+
+  "Parameters" : {
+    "KeyName" : {
+      "Description" : "The EC2 Key Pair to allow SSH access to the instance",
+      "Type" : "AWS::EC2::KeyPair::KeyName"
+    }
+  },
+
+  "Resources" : {
+
+    "ElasticLoadBalancer" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "CrossZone" : "true",
+        "AvailabilityZones" : { "Fn::GetAZs" : "" },
+        "LBCookieStickinessPolicy" : [ {
+          "PolicyName" : "CookieBasedPolicy",
+          "CookieExpirationPeriod" : "30"
+        } ],
+        "Listeners" : [ {
+          "LoadBalancerPort" : "80",
+          "InstancePort" : "80",
+          "Protocol" : "HTTP",
+          "PolicyNames" : [ "CookieBasedPolicy" ]
+        } ],
+        "HealthCheck" : {
+          "Target" : "HTTP:80/",
+          "HealthyThreshold" : "2",
+          "UnhealthyThreshold" : "5",
+          "Interval" : "10",
+          "Timeout" : "5"
+        }
+      }
+    },
+
+    "asGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "AvailabilityZones" : { "Fn::GetAZs" : ""},
+        "LaunchConfigurationName" : { "Ref" : "LaunchConfig" },
+        "MinSize" : "1",
+        "MaxSize" : "2",
+        "LoadBalancerNames" : [ { "Ref" : "ElasticLoadBalancer" } ]
+        }
+    },
+
+    "LaunchConfig" : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+
+      "Metadata" : {
+        "Comment" : "Install a simple application",
+        "AWS::CloudFormation::Init" : {
+          "configSets": {
+            "installScripts": [
+              "upload",
+              "webInstall"            
+            ]
+          },
+          "upload": {
+            "files" : {
+              "/root/webapp.install.sh" : {
+                "source": "https://s3.amazonaws.com/scripts_webapp/webapp.install.sh",
+                "mode"    : "000700",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+              "/root/hello.js" : {
+                "source": "https://s3.amazonaws.com/scripts_webapp/hello.js",
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              },
+              "/root/default" : {
+                "source": "https://s3.amazonaws.com/scripts_webapp/default",
+                "mode"    : "000644",
+                "owner"   : "root",
+                "group"   : "root"
+              }
+            }
+          },
+          "webInstall":{
+            "commands":{
+              "1webInstaller":{
+                "command":"/root/webapp.install.sh"
+              }
+            }
+          }
+        }
+      },
+      "Properties" : {
+        "SecurityGroups" : [ { "Ref" : "InstanceSecurityGroup" } ],
+        "KeyName" : { "Ref" : "KeyName"},
+        "ImageId" : "ami-d85e75b0",
+        "InstanceType" : "t1.micro",
+        "BlockDeviceMappings" : [ {
+            "DeviceName" : "/dev/sdk",
+            "Ebs" : {"VolumeSize" : "10"}
+        } ],
+        "UserData": {
+            "Fn::Base64": {
+                "Fn::Join": [
+                    "",
+                    [
+                        "#!/bin/bash -x\n",
+                        "curl https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz -s -k -o /tmp/cfn-bootstrap.tar.gz\n",
+                        "cd /opt\n",
+                        "tar xfz /tmp/cfn-bootstrap.tar.gz\n",
+                        "cd aws-cfn-bootstrap*\n",
+                        "python ./setup.py install\n",
+                        "chmod u+x bin/*\n",
+                        "aws configure set preview.cloudfront true\n",
+                        "/opt/aws-cfn-bootstrap*/bin/cfn-init",
+                        " -v",
+                        " --stack ",
+                        {
+                            "Ref": "AWS::StackName"
+                        },
+                        " --resource LaunchConfig",
+                        " --configsets installScripts",
+                        " --region ",
+                        {
+                            "Ref": "AWS::Region"
+                        },
+                        "\n",
+                        "/opt/aws-cfn-bootstrap*/bin/cfn-signal -e $? --stack ",
+                        {
+                            "Ref": "AWS::StackName"
+                        },
+                        " --resource asGroup --region ",
+                        {
+                            "Ref": "AWS::Region"
+                        },
+                        "\n"
+                    ]
+                ]
+            }
+        }
+      }
+    },
+
+    "ScaleUpPolicy" : {
+      "Type" : "AWS::AutoScaling::ScalingPolicy",
+      "Properties" : {
+        "AdjustmentType" : "ChangeInCapacity",
+        "AutoScalingGroupName" : { "Ref" : "asGroup" },
+        "Cooldown" : "1",
+        "ScalingAdjustment" : "1"
+        }
+    },
+
+    "CPUAlarmHigh": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "EvaluationPeriods": "1",
+        "Statistic": "Average",
+        "Threshold": "10",
+        "AlarmDescription": "Alarm if CPU too high or metric disappears indicating instance is down",
+        "Period": "600",
+        "AlarmActions": [ { "Ref": "ScaleUpPolicy" } ],
+        "Namespace": "AWS/EC2",
+        "Dimensions": [ {
+          "Name": "AutoScalingGroupName",
+          "Value": { "Ref": "asGroup" }
+        } ],
+        "ComparisonOperator": "GreaterThanThreshold",
+        "MetricName": "CPUUtilization"
+        }
+    },
+
+    "ScaleDownPolicy" : {
+      "Type" : "AWS::AutoScaling::ScalingPolicy",
+      "Properties" : {
+        "AdjustmentType" : "ChangeInCapacity",
+        "AutoScalingGroupName" : { "Ref" : "asGroup" },
+        "Cooldown" : "1",
+        "ScalingAdjustment" : "-1"
+        }
+    },
+
+    "CPUAlarmLow": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "EvaluationPeriods": "1",
+        "Statistic": "Average",
+        "Threshold": "5",
+        "AlarmDescription": "Alarm if CPU too high or metric disappears indicating instance is down",
+        "Period": "600",
+        "AlarmActions": [ { "Ref": "ScaleDownPolicy" } ],
+        "Namespace": "AWS/EC2",
+        "Dimensions": [ {
+          "Name": "AutoScalingGroupName",
+          "Value": { "Ref": "asGroup" }
+        } ],
+        "ComparisonOperator": "LessThanThreshold",
+        "MetricName": "CPUUtilization"
+        }
+    },
+
+    "InstanceSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable SSH access via port 22 and HTTP access via port 80",
+        "SecurityGroupIngress" : [
+          {"IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "CidrIp" : "0.0.0.0/0"},
+          {"IpProtocol" : "tcp", "FromPort" : "22", "ToPort" : "22", "CidrIp" : "0.0.0.0/0"}
+        ]
+      }
+    }
+  }
+}
